@@ -1,3 +1,22 @@
+// Routes de synchronisation Kataleya — modèle A+B hybride, LWW serveur-arbitre.
+//
+// Flux nominal (Phase 4+) :
+//   • Client → GET /sync-state?since=<v> : inventaire des lignes modifiées
+//     depuis sa dernière version connue. Pas de filtre client_id — chacun voit
+//     tout, l'arbitrage LWW se fait à l'écriture.
+//   • Client → GET /sync-state/full?table=…&since=… : payload joint
+//     sync_state + lignes métier, pour rattraper une table en un seul appel.
+//   • Client → GET /api/sync/:table/:id : récupère la row canonique d'une
+//     entrée (utilisé après une entrée pull non-suppression).
+//   • Client → POST/PUT/DELETE /:table[/:id] : applique localement puis push
+//     avec `_version`/`_updatedAt`. Le serveur arbitre via `arbitrateLWW` et
+//     répond `{applied: "client" | "server", currentVersion, data?}`.
+//   • SSE /api/sync/events : trigger pur — émet un `journal_update` à chaque
+//     écriture, le client se contente d'appeler son `requestSync()` debouncé.
+//
+// `sync_journal` n'est plus la source de vérité du pull : démoté en audit log
+// append-only (cf. GET /journal). `sync_state` est l'unique état autoritaire.
+
 import { Hono, type Context } from "hono";
 import type { Env, Variables } from "../types";
 import { buildModels, isSyncableTable } from "../models";
@@ -41,6 +60,99 @@ function errMsg(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
 }
 
+// Phase 2.3 — arbitrage LWW serveur-prioritaire.
+// Règle :
+//  • body._version absent  → pas d'arbitrage (compat ancien client) → apply.
+//  • body._version === currentServerVersion → apply (bump +1).
+//  • body._version  <  currentServerVersion → server gagne, on renvoie la row
+//    canonique avec applied="server" et currentVersion serveur.
+//  • body._version  >  currentServerVersion → ne devrait pas arriver, on apply
+//    pour rester self-healing.
+// `_updatedAt` est uniquement informatif pour l'instant (tracé dans logs si
+// divergence) — la version entière reste l'autorité.
+type LwwDecision =
+    | { apply: true; cleanBody: Record<string, unknown> }
+    | {
+          apply: false;
+          response: { applied: "server"; currentVersion: number; data: unknown };
+      };
+
+async function arbitrateLWW(
+    c: Ctx,
+    table: string,
+    id: string,
+    body: Record<string, unknown>,
+): Promise<LwwDecision> {
+    const { _version, _updatedAt, ...cleanBody } = body as Record<string, unknown> & {
+        _version?: number;
+        _updatedAt?: string;
+    };
+    if (typeof _version !== "number") {
+        return { apply: true, cleanBody };
+    }
+    const { orm } = buildModels(c.env.DB);
+    const rows = await orm
+        .query<{ version: number; updatedAt: string }>(
+            `SELECT version, updatedAt FROM sync_state
+             WHERE table_name = ? AND element_id = ?`,
+            [table, id],
+        )
+        .catch(() => []);
+    const current = rows[0];
+    if (!current) return { apply: true, cleanBody };
+
+    if (_version >= current.version) {
+        return { apply: true, cleanBody };
+    }
+
+    // Client en retard → on lui renvoie la row canonique du serveur.
+    const models = buildModels(c.env.DB) as any;
+    const canonical = await models[table].findById(id).catch(() => null);
+    if (_updatedAt && _updatedAt > current.updatedAt) {
+        console.warn(
+            `[sync_state] LWW ${table}/${id} : client _updatedAt (${_updatedAt}) ` +
+                `> server updatedAt (${current.updatedAt}) mais _version obsolète ` +
+                `(${_version} < ${current.version}). Version reste l'autorité.`,
+        );
+    }
+    return {
+        apply: false,
+        response: {
+            applied: "server",
+            currentVersion: current.version,
+            data: canonical,
+        },
+    };
+}
+
+// Phase 1.3 — bump atomique de sync_state pour une ligne donnée.
+// UPSERT : crée la row si absente (version=1), sinon incrémente version.
+// updatedAt/updatedBy sont écrasés à chaque write pour refléter le dernier acteur.
+async function bumpSyncState(
+    c: Ctx,
+    table: string,
+    id: string,
+    deleted: boolean,
+): Promise<void> {
+    const { orm } = buildModels(c.env.DB);
+    const userId = c.get("userId") || "unknown";
+    const now = nowISO();
+    try {
+        await orm.run(
+            `INSERT INTO sync_state (table_name, element_id, version, updatedAt, updatedBy, deleted)
+             VALUES (?, ?, 1, ?, ?, ?)
+             ON CONFLICT(table_name, element_id) DO UPDATE SET
+                 version   = sync_state.version + 1,
+                 updatedAt = excluded.updatedAt,
+                 updatedBy = excluded.updatedBy,
+                 deleted   = excluded.deleted`,
+            [table, id, now, userId, deleted ? 1 : 0],
+        );
+    } catch (e) {
+        console.error(`[sync_state] bump ${table}/${id} échec`, errMsg(e));
+    }
+}
+
 async function logJournal(
     c: Ctx,
     operation: "create" | "update" | "delete",
@@ -65,18 +177,135 @@ async function logJournal(
     return id;
 }
 
+// ─── GET /sync-state?since=<version>&limit=<n> ───────────────────────
+// Phase 2.1 — inventaire des lignes modifiées depuis `since`.
+// Pas de filtre par client_id : tous les clients voient les mêmes changements
+// (LWW arbitré côté serveur). Retourne maxVersion pour le prochain `since`.
+app.get("/sync-state", async (c) => {
+    const since = Number(c.req.query("since") ?? "0") || 0;
+    const limitRaw = Number(c.req.query("limit") ?? "1000") || 1000;
+    const limit = Math.min(Math.max(limitRaw, 1), 5000);
+    const { orm } = buildModels(c.env.DB);
+
+    const items = await orm.query<{
+        table_name: string;
+        element_id: string;
+        version: number;
+        updatedAt: string;
+        updatedBy: string;
+        deleted: number;
+    }>(
+        `SELECT table_name, element_id, version, updatedAt, updatedBy, deleted
+         FROM sync_state
+         WHERE version > ?
+         ORDER BY version ASC
+         LIMIT ?`,
+        [since, limit + 1],
+    );
+    const hasMore = items.length > limit;
+    if (hasMore) items.pop();
+
+    const maxRow = await orm
+        .query<{ v: number | null }>(
+            `SELECT MAX(version) as v FROM sync_state`,
+            [],
+        )
+        .catch(() => [{ v: 0 } as { v: number | null }]);
+
+    return c.json({
+        items: items.map((r) => ({
+            table: r.table_name,
+            id: r.element_id,
+            version: r.version,
+            updatedAt: r.updatedAt,
+            updatedBy: r.updatedBy,
+            deleted: r.deleted === 1,
+        })),
+        maxVersion: Number(maxRow[0]?.v ?? 0),
+        hasMore,
+        serverTime: nowISO(),
+    });
+});
+
+// ─── GET /sync-state/full?table=<name>&since=<version> ───────────────
+// Phase 2.2 — payload joint : sync_state + lignes métier de la table.
+// Pratique pour un client qui veut rattraper son retard sur une table précise
+// sans faire N round-trips. `deleted=1` → row absente de `rows`.
+app.get("/sync-state/full", async (c) => {
+    const table = c.req.query("table") || "";
+    const since = Number(c.req.query("since") ?? "0") || 0;
+    const limitRaw = Number(c.req.query("limit") ?? "1000") || 1000;
+    const limit = Math.min(Math.max(limitRaw, 1), 5000);
+    if (!isSyncableTable(table)) return bad(c, "table inconnue", 404);
+
+    const { orm } = buildModels(c.env.DB);
+
+    const states = await orm.query<{
+        element_id: string;
+        version: number;
+        updatedAt: string;
+        updatedBy: string;
+        deleted: number;
+    }>(
+        `SELECT element_id, version, updatedAt, updatedBy, deleted
+         FROM sync_state
+         WHERE table_name = ? AND version > ?
+         ORDER BY version ASC
+         LIMIT ?`,
+        [table, since, limit + 1],
+    );
+    const hasMore = states.length > limit;
+    if (hasMore) states.pop();
+
+    const liveIds = states.filter((s) => s.deleted !== 1).map((s) => s.element_id);
+    let rowsById = new Map<string, Record<string, unknown>>();
+    if (liveIds.length > 0) {
+        const placeholders = liveIds.map(() => "?").join(",");
+        const rows = await orm.query<Record<string, unknown> & { id: string }>(
+            `SELECT * FROM ${table} WHERE id IN (${placeholders})`,
+            liveIds,
+        );
+        rowsById = new Map(rows.map((r) => [String(r.id), r]));
+    }
+
+    const maxRow = await orm
+        .query<{ v: number | null }>(
+            `SELECT MAX(version) as v FROM sync_state WHERE table_name = ?`,
+            [table],
+        )
+        .catch(() => [{ v: 0 } as { v: number | null }]);
+
+    return c.json({
+        table,
+        items: states.map((s) => ({
+            id: s.element_id,
+            version: s.version,
+            updatedAt: s.updatedAt,
+            updatedBy: s.updatedBy,
+            deleted: s.deleted === 1,
+            data: s.deleted === 1 ? null : rowsById.get(s.element_id) ?? null,
+        })),
+        maxVersion: Number(maxRow[0]?.v ?? 0),
+        hasMore,
+        serverTime: nowISO(),
+    });
+});
+
 // ─── GET /journal?since=<ISO> ────────────────────────────────────────
+// Phase 6 — démoté en audit log. Plus consulté pour le pull primaire
+// (sync_state s'en charge). Cet endpoint reste exposé pour diagnostic et
+// historique : plus de filtre `client_id != ?`, chaque appelant voit le
+// journal complet trié par `timestamp`.
 app.get("/journal", async (c) => {
     const since = c.req.query("since") || "";
-    const clientId = c.req.header("X-Client-ID") || "";
     const { orm } = buildModels(c.env.DB);
 
     const sql = since
         ? `SELECT id, operation, id_element, table_name, timestamp, client_id FROM sync_journal
-           WHERE timestamp > ? AND client_id != ? ORDER BY timestamp ASC LIMIT 1000`
+           WHERE timestamp > ? ORDER BY timestamp ASC LIMIT 1000`
         : `SELECT id, operation, id_element, table_name, timestamp, client_id FROM sync_journal
-           WHERE client_id != ? ORDER BY timestamp ASC LIMIT 1000`;
-    const params = since ? [since, clientId] : [clientId];
+           ORDER BY timestamp ASC LIMIT 1000`;
+    const params = since ? [since] : [];
 
     const rows = await orm.query<any>(sql, params);
     return c.json({
@@ -111,9 +340,12 @@ app.post("/:table", async (c) => {
     const body = await c.req.json<Record<string, unknown>>();
     if (!body || !body.id) return bad(c, "id requis");
 
-    const models = buildModels(c.env.DB) as any;
     const id = String(body.id);
-    const normalized = normalizeForD1(body);
+    const decision = await arbitrateLWW(c, table, id, body);
+    if (!decision.apply) return c.json(decision.response);
+
+    const models = buildModels(c.env.DB) as any;
+    const normalized = normalizeForD1(decision.cleanBody);
     const existing = await models[table].findById(id).catch(() => null);
     try {
         if (existing) {
@@ -126,8 +358,19 @@ app.post("/:table", async (c) => {
         console.error(`[sync] POST /${table} échec écriture`, id, errMsg(e));
         return bad(c, `écriture impossible: ${errMsg(e)}`, 422);
     }
-    const journalId = await logJournal(c, "create", table, id, body);
-    return c.json({ ok: true, journalId });
+    await bumpSyncState(c, table, id, false);
+    const journalId = await logJournal(c, "create", table, id, decision.cleanBody);
+    const { orm } = buildModels(c.env.DB);
+    const after = await orm.query<{ version: number }>(
+        `SELECT version FROM sync_state WHERE table_name = ? AND element_id = ?`,
+        [table, id],
+    );
+    return c.json({
+        ok: true,
+        applied: "client",
+        currentVersion: after[0]?.version ?? 1,
+        journalId,
+    });
 });
 
 // ─── PUT /:table/:id  (update) ───────────────────────────────────────
@@ -143,8 +386,11 @@ app.put("/:table/:id", async (c) => {
         return bad(c, "body vide", 422);
     }
 
+    const decision = await arbitrateLWW(c, table, id, body);
+    if (!decision.apply) return c.json(decision.response);
+
     const models = buildModels(c.env.DB) as any;
-    const normalized = normalizeForD1(body);
+    const normalized = normalizeForD1(decision.cleanBody);
     const existing = await models[table].findById(id).catch(() => null);
     try {
         if (existing) {
@@ -160,8 +406,19 @@ app.put("/:table/:id", async (c) => {
         console.error(`[sync] PUT /${table}/${id} échec écriture`, errMsg(e), body);
         return bad(c, `écriture impossible: ${errMsg(e)}`, 422);
     }
-    const journalId = await logJournal(c, "update", table, id, body);
-    return c.json({ ok: true, journalId });
+    await bumpSyncState(c, table, id, false);
+    const journalId = await logJournal(c, "update", table, id, decision.cleanBody);
+    const { orm } = buildModels(c.env.DB);
+    const after = await orm.query<{ version: number }>(
+        `SELECT version FROM sync_state WHERE table_name = ? AND element_id = ?`,
+        [table, id],
+    );
+    return c.json({
+        ok: true,
+        applied: "client",
+        currentVersion: after[0]?.version ?? 1,
+        journalId,
+    });
 });
 
 // ─── DELETE /:table/:id ──────────────────────────────────────────────
@@ -173,6 +430,7 @@ app.delete("/:table/:id", async (c) => {
     if (!isSyncableTable(table)) return bad(c, "table inconnue", 404);
     const models = buildModels(c.env.DB) as any;
     await models[table].deleteById(id).catch(() => undefined);
+    await bumpSyncState(c, table, id, true);
     const journalId = await logJournal(c, "delete", table, id, null);
     return c.json({ ok: true, journalId });
 });
@@ -181,7 +439,6 @@ app.delete("/:table/:id", async (c) => {
 // Polling-based stream: vérifie le journal toutes les 3s pendant 25s,
 // l'EventSource côté client se reconnectera automatiquement.
 app.get("/api/sync/events", async (c) => {
-    const clientId = c.req.header("X-Client-ID") || c.req.query("clientId") || "";
     const { orm } = buildModels(c.env.DB);
 
     const encoder = new TextEncoder();
@@ -199,12 +456,15 @@ app.get("/api/sync/events", async (c) => {
             while (Date.now() - start < 25_000) {
                 await new Promise((r) => setTimeout(r, 3000));
                 try {
+                    // Phase 6 — plus de filtre client_id. SSE = trigger pur :
+                    // le client reçoit aussi ses propres événements mais sa
+                    // logique requestSync() est debouncée, donc inoffensif.
                     const rows = await orm.query<any>(
                         `SELECT id, operation, id_element, table_name, timestamp, client_id
                          FROM sync_journal
-                         WHERE timestamp > ? AND client_id != ?
+                         WHERE timestamp > ?
                          ORDER BY timestamp ASC LIMIT 100`,
-                        [lastTs, clientId],
+                        [lastTs],
                     );
                     for (const r of rows) {
                         send({

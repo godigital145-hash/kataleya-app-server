@@ -5,6 +5,8 @@ import { verifyToken } from "./lib/auth";
 import { buildModels, initDatabase, SYNCABLE_TABLES } from "./models";
 import authRoutes from "./routes/auth";
 import syncRoutes from "./routes/sync";
+import imagesRoutes from "./routes/images";
+import publicRoutes from "./routes/public";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -80,6 +82,10 @@ app.use("/me", requireAuth);
 app.use("/journal", requireAuth);
 app.use("/api/sync/*", requireAuth);
 app.use("/admin/status", requireAuth);
+app.use("/admin/sync-state", requireAuth);
+app.use("/sync-state", requireAuth);
+app.use("/sync-state/*", requireAuth);
+app.use("/images/*", requireAuth);
 
 // État global du serveur : utilisé par le client pour décider s'il doit faire
 // un bootstrap (push initial des données locales) quand le D1 est vide.
@@ -105,12 +111,45 @@ app.get("/admin/status", async (c) => {
         .every(([, n]) => n === 0);
     return c.json({ empty, counts });
 });
+// Inspection de sync_state — sert de test pour les jalons Phase 1.
+app.get("/admin/sync-state", async (c) => {
+    const { orm } = buildModels(c.env.DB);
+    const total = await orm
+        .query<{ n: number }>(`SELECT COUNT(*) as n FROM sync_state`, [])
+        .catch(() => [{ n: 0 } as { n: number }]);
+    const maxV = await orm
+        .query<{ v: number | null }>(
+            `SELECT MAX(version) as v FROM sync_state`,
+            [],
+        )
+        .catch(() => [{ v: 0 } as { v: number | null }]);
+    const byTable = await orm
+        .query<{ table_name: string; n: number; maxVersion: number }>(
+            `SELECT table_name, COUNT(*) as n, MAX(version) as maxVersion
+             FROM sync_state GROUP BY table_name ORDER BY table_name`,
+            [],
+        )
+        .catch(() => []);
+    return c.json({
+        total: Number(total[0]?.n ?? 0),
+        maxVersion: Number(maxV[0]?.v ?? 0),
+        byTable,
+    });
+});
+
 for (const t of SYNCABLE_TABLES) {
     app.use(`/${t}`, requireAuth);
     app.use(`/${t}/*`, requireAuth);
 }
 
+// Routes publiques (site internet) — montées AVANT syncRoutes pour passer
+// avant le handler générique `POST /:table` / `PUT /:table/:id`.
+app.route("/", publicRoutes);
+
 app.route("/", authRoutes);
+// imagesRoutes AVANT syncRoutes : sync définit un PUT/:table/:id générique qui
+// matcherait /images/:name et renverrait 404 (table inconnue). Ordre = priorité.
+app.route("/", imagesRoutes);
 app.route("/", syncRoutes);
 
 export default app;

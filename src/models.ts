@@ -207,6 +207,39 @@ export type Projet = {
     createdBy: string;
 };
 
+export type Boutique = {
+    id: string;
+    nom: string;
+    adresse?: string;
+    userId?: string;
+    isPrincipal: number;
+    statut: string;
+    createdAt: string;
+    updatedAt: string;
+};
+
+export type StockBoutique = {
+    id: string;
+    boutiqueId: string;
+    articleId: string;
+    varianteId?: string;
+    quantite: number;
+    updatedAt: string;
+};
+
+export type TransfertStock = {
+    id: string;
+    articleId: string;
+    varianteId?: string;
+    boutiqueSourceId?: string;
+    boutiqueDestId?: string;
+    quantite: number;
+    sens: string;
+    userId: string;
+    note?: string;
+    createdAt: string;
+};
+
 export type TacheProjet = {
     id: string;
     projetId: string;
@@ -420,6 +453,36 @@ export function buildModels(db: D1Database) {
             updatedAt: "TEXT NOT NULL",
             createdBy: "TEXT NOT NULL",
         }),
+        boutiques: f.createModel<Boutique>("boutiques", {
+            id: "TEXT PRIMARY KEY NOT NULL",
+            nom: "TEXT NOT NULL",
+            adresse: "TEXT",
+            userId: "TEXT",
+            isPrincipal: "INTEGER NOT NULL",
+            statut: "TEXT NOT NULL",
+            createdAt: "TEXT NOT NULL",
+            updatedAt: "TEXT NOT NULL",
+        }),
+        stocks_boutique: f.createModel<StockBoutique>("stocks_boutique", {
+            id: "TEXT PRIMARY KEY NOT NULL",
+            boutiqueId: "TEXT NOT NULL",
+            articleId: "TEXT NOT NULL",
+            varianteId: "TEXT",
+            quantite: "INTEGER NOT NULL",
+            updatedAt: "TEXT NOT NULL",
+        }),
+        transferts_stock: f.createModel<TransfertStock>("transferts_stock", {
+            id: "TEXT PRIMARY KEY NOT NULL",
+            articleId: "TEXT NOT NULL",
+            varianteId: "TEXT",
+            boutiqueSourceId: "TEXT",
+            boutiqueDestId: "TEXT",
+            quantite: "INTEGER NOT NULL",
+            sens: "TEXT NOT NULL",
+            userId: "TEXT NOT NULL",
+            note: "TEXT",
+            createdAt: "TEXT NOT NULL",
+        }),
         taches_projet: f.createModel<TacheProjet>("taches_projet", {
             id: "TEXT PRIMARY KEY NOT NULL",
             projetId: "TEXT NOT NULL",
@@ -453,6 +516,9 @@ export const SYNCABLE_TABLES = [
     "techniciens",
     "projets",
     "taches_projet",
+    "boutiques",
+    "stocks_boutique",
+    "transferts_stock",
 ] as const;
 
 export type SyncableTable = (typeof SYNCABLE_TABLES)[number];
@@ -475,4 +541,75 @@ export async function initDatabase(db: D1Database): Promise<void> {
     await m.techniciens.createTable();
     await m.projets.createTable();
     await m.taches_projet.createTable();
+    await m.boutiques.createTable();
+    await m.stocks_boutique.createTable();
+    await m.transferts_stock.createTable();
+    await ensureSyncStateTable(m.orm);
+    await seedSyncStateIfEmpty(m.orm);
+}
+
+// ─── sync_state : index de version partagé serveur↔clients ───────────
+// Une ligne par (table_name, element_id). `version` est bumpé à chaque
+// mutation serveur ; les clients pullent par `version > since`.
+async function ensureSyncStateTable(orm: SimpleORM): Promise<void> {
+    await orm.run(
+        `CREATE TABLE IF NOT EXISTS sync_state (
+            table_name TEXT NOT NULL,
+            element_id TEXT NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updatedAt  TEXT NOT NULL,
+            updatedBy  TEXT NOT NULL,
+            deleted    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (table_name, element_id)
+        )`,
+    );
+    await orm.run(
+        `CREATE INDEX IF NOT EXISTS idx_sync_state_version ON sync_state(version)`,
+    );
+    await orm.run(
+        `CREATE INDEX IF NOT EXISTS idx_sync_state_table ON sync_state(table_name)`,
+    );
+}
+
+// lignes_documents n'a pas de colonne updatedAt/createdAt → on retombe
+// sur datetime('now') pour le seed initial.
+const TABLES_WITHOUT_TIMESTAMPS = new Set<string>(["lignes_documents"]);
+// `stocks_boutique` n'a que `updatedAt`, `transferts_stock` n'a que `createdAt` —
+// le COALESCE(updatedAt, createdAt, datetime('now')) couvre les deux cas.
+
+// Seed rétroactif : si sync_state est vide mais qu'il existe déjà des
+// données métier (cas d'un D1 préexistant), on insère un row par entité
+// avec version=1, updatedBy='bootstrap'. Idempotent via WHERE NOT EXISTS.
+async function seedSyncStateIfEmpty(orm: SimpleORM): Promise<void> {
+    const existing = await orm
+        .query<{ n: number }>(`SELECT COUNT(*) as n FROM sync_state`, [])
+        .catch(() => [{ n: 0 } as { n: number }]);
+    if ((existing[0]?.n ?? 0) > 0) return;
+
+    const seeded: Record<string, number> = {};
+    for (const table of SYNCABLE_TABLES) {
+        const updatedAtExpr = TABLES_WITHOUT_TIMESTAMPS.has(table)
+            ? `datetime('now')`
+            : `COALESCE(updatedAt, createdAt, datetime('now'))`;
+        try {
+            await orm.run(
+                `INSERT INTO sync_state (table_name, element_id, version, updatedAt, updatedBy, deleted)
+                 SELECT '${table}', id, 1, ${updatedAtExpr}, 'bootstrap', 0
+                 FROM ${table}
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sync_state s
+                     WHERE s.table_name = '${table}' AND s.element_id = ${table}.id
+                 )`,
+                [],
+            );
+            const counted = await orm.query<{ n: number }>(
+                `SELECT COUNT(*) as n FROM sync_state WHERE table_name = ?`,
+                [table],
+            );
+            seeded[table] = Number(counted[0]?.n ?? 0);
+        } catch (e) {
+            console.error(`[sync_state] seed ${table} échec`, e);
+        }
+    }
+    console.log(`[sync_state] bootstrap rétroactif`, seeded);
 }

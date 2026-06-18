@@ -8,40 +8,49 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 const ADMIN_ROLES = new Set(["super_admin", "admin"]);
 
 app.post("/login", async (c) => {
-    const body = await c.req.json<{ email: string; password: string }>();
-    if (!body.email || !body.password) {
-        return c.json({ error: "email et password requis" }, 400);
-    }
-    const { administrateurs } = buildModels(c.env.DB);
-    const admin = await administrateurs.findOne({ where: { email: body.email } });
-    if (!admin) return c.json({ error: "identifiants invalides" }, 401);
-    if (admin.statut !== "actif") {
-        return c.json({ error: "compte désactivé" }, 401);
-    }
-    const ok = await verifyPassword(body.password, admin.motDePasseHash);
-    if (!ok) return c.json({ error: "identifiants invalides" }, 401);
+    try {
+        const body = await c.req.json<{ email: string; password: string }>();
+        if (!body.email || !body.password) {
+            return c.json({ error: "email et password requis" }, 400);
+        }
+        const { administrateurs } = buildModels(c.env.DB);
+        const admin = await administrateurs.findOne({ where: { email: body.email } });
+        if (!admin) return c.json({ error: "identifiants invalides" }, 401);
+        if (admin.statut !== "actif") {
+            return c.json({ error: "compte désactivé" }, 401);
+        }
+        const ok = await verifyPassword(body.password, admin.motDePasseHash);
+        if (!ok) return c.json({ error: "identifiants invalides" }, 401);
 
-    const now = new Date().toISOString();
-    await administrateurs.update(admin.id, {
-        derniereConnexion: now,
-        updatedAt: now,
-    });
+        const now = new Date().toISOString();
+        await administrateurs.update(admin.id, {
+            derniereConnexion: now,
+            updatedAt: now,
+        });
 
-    const token = await issueToken(c.env.JWT_SECRET, c.env.JWT_ISSUER, {
-        id: admin.id,
-        email: admin.email,
-        role: admin.role,
-    });
-    return c.json({
-        token,
-        user: {
+        const token = await issueToken(c.env.JWT_SECRET, c.env.JWT_ISSUER, {
             id: admin.id,
             email: admin.email,
-            nom: admin.nom,
-            prenom: admin.prenom,
             role: admin.role,
-        },
-    });
+        });
+        return c.json({
+            token,
+            user: {
+                id: admin.id,
+                email: admin.email,
+                nom: admin.nom,
+                prenom: admin.prenom,
+                role: admin.role,
+            },
+        });
+    } catch (e) {
+        const err = e as Error;
+        console.error("[/login] 500", err?.stack || err?.message || err);
+        return c.json(
+            { error: "login failed", detail: err?.message ?? String(e) },
+            500,
+        );
+    }
 });
 
 app.get("/me", async (c) => {

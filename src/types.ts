@@ -1,5 +1,6 @@
 export type Env = {
     DB: D1Database;
+    IMAGES: R2Bucket;
     JWT_SECRET: string;
     JWT_ISSUER: string;
 };
