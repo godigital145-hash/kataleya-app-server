@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "kataleya"
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "87e1374c-11d6-4cbf-a81a-422497d01ac3"
 
 [[r2_buckets]]
 binding = "IMAGES"
