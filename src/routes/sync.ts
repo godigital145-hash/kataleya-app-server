@@ -49,6 +49,8 @@ function normalizeForD1(
         if (value === undefined) continue;
         if (value !== null && typeof value === "object") {
             out[key] = JSON.stringify(value);
+        } else if (typeof value === "boolean") {
+            out[key] = value ? 1 : 0;
         } else {
             out[key] = value;
         }

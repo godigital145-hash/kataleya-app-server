@@ -115,6 +115,8 @@ export type Devis = {
     totalHT: number;
     totalTVA: number;
     totalTTC: number;
+    afficherTVA: number;
+    afficherTVALignes: number;
     remiseGlobale: number;
     totalApreRemise: number;
     statut: string;
@@ -140,6 +142,8 @@ export type Facture = {
     totalHT: number;
     totalTVA: number;
     totalTTC: number;
+    afficherTVA: number;
+    afficherTVALignes: number;
     remiseGlobale: number;
     totalApreRemise: number;
     montantPayé: number;
@@ -366,6 +370,8 @@ export function buildModels(db: D1Database) {
             totalHT: "REAL NOT NULL",
             totalTVA: "REAL NOT NULL",
             totalTTC: "REAL NOT NULL",
+            afficherTVA: "INTEGER NOT NULL DEFAULT 1",
+            afficherTVALignes: "INTEGER NOT NULL DEFAULT 1",
             remiseGlobale: "REAL NOT NULL",
             totalApreRemise: "REAL NOT NULL",
             statut: "TEXT NOT NULL",
@@ -390,6 +396,8 @@ export function buildModels(db: D1Database) {
             totalHT: "REAL NOT NULL",
             totalTVA: "REAL NOT NULL",
             totalTTC: "REAL NOT NULL",
+            afficherTVA: "INTEGER NOT NULL DEFAULT 1",
+            afficherTVALignes: "INTEGER NOT NULL DEFAULT 1",
             remiseGlobale: "REAL NOT NULL",
             totalApreRemise: "REAL NOT NULL",
             montantPayé: "REAL NOT NULL",
@@ -546,6 +554,7 @@ export async function initDatabase(db: D1Database): Promise<void> {
     await m.transferts_stock.createTable();
     await ensureSyncStateTable(m.orm);
     await seedSyncStateIfEmpty(m.orm);
+    await runMigrations(m.orm);
 }
 
 // ─── sync_state : index de version partagé serveur↔clients ───────────
@@ -569,6 +578,49 @@ async function ensureSyncStateTable(orm: SimpleORM): Promise<void> {
     await orm.run(
         `CREATE INDEX IF NOT EXISTS idx_sync_state_table ON sync_state(table_name)`,
     );
+}
+
+// ─── Migrations ──────────────────────────────────────────────────────
+const MIGRATIONS: Array<{ name: string; sql: string }> = [
+    {
+        name: "v1_afficherTVA",
+        sql: `ALTER TABLE devis ADD COLUMN afficherTVA INTEGER NOT NULL DEFAULT 1`,
+    },
+    {
+        name: "v1_afficherTVALignes",
+        sql: `ALTER TABLE devis ADD COLUMN afficherTVALignes INTEGER NOT NULL DEFAULT 1`,
+    },
+    {
+        name: "v1_afficherTVA_factures",
+        sql: `ALTER TABLE factures ADD COLUMN afficherTVA INTEGER NOT NULL DEFAULT 1`,
+    },
+    {
+        name: "v1_afficherTVALignes_factures",
+        sql: `ALTER TABLE factures ADD COLUMN afficherTVALignes INTEGER NOT NULL DEFAULT 1`,
+    },
+];
+
+async function runMigrations(orm: SimpleORM): Promise<void> {
+    await orm.run(
+        `CREATE TABLE IF NOT EXISTS _migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+    );
+    for (const m of MIGRATIONS) {
+        const existing = await orm.query<{ n: number }>(
+            `SELECT COUNT(*) as n FROM _migrations WHERE name = ?`,
+            [m.name],
+        );
+        if (existing[0]?.n && existing[0].n > 0) continue;
+        try {
+            await orm.run(m.sql, []);
+            await orm.run(`INSERT INTO _migrations (name) VALUES (?)`, [m.name]);
+            console.log(`[migration] ${m.name} appliquée`);
+        } catch (e) {
+            console.warn(`[migration] ${m.name} ignorée (colonne existe déjà ?)`, e);
+        }
+    }
 }
 
 // lignes_documents n'a pas de colonne updatedAt/createdAt → on retombe
