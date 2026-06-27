@@ -138,7 +138,13 @@ app.post("/auth/bootstrap-admins", async (c) => {
 });
 
 // Conservé pour future création serveur-only ; reste basé sur administrateurs.
+// Réservé au super_admin (la route est également protégée par requireAuth côté
+// index.ts) : n'importe quel utilisateur authentifié ne doit pas pouvoir créer
+// un compte admin.
 app.post("/register", async (c) => {
+    if (c.get("userRole") !== "super_admin") {
+        return c.json({ error: "réservé au super_admin" }, 403);
+    }
     const body = await c.req.json<{
         email: string;
         password: string;

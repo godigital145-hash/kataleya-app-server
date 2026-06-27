@@ -44,12 +44,6 @@ app.use(
 
 app.get("/health", (c) => c.json({ ok: true, time: Date.now() }));
 
-// Initialisation idempotente des tables D1 (appelée à la demande)
-app.post("/admin/init", async (c) => {
-    await initDatabase(c.env.DB);
-    return c.json({ ok: true, tables: SYNCABLE_TABLES });
-});
-
 async function requireAuth(
     c: Context<{ Bindings: Env; Variables: Variables }>,
     next: Next,
@@ -83,9 +77,22 @@ app.use("/journal", requireAuth);
 app.use("/api/sync/*", requireAuth);
 app.use("/admin/status", requireAuth);
 app.use("/admin/sync-state", requireAuth);
+app.use("/admin/init", requireAuth);
+app.use("/register", requireAuth);
 app.use("/sync-state", requireAuth);
 app.use("/sync-state/*", requireAuth);
 app.use("/images/*", requireAuth);
+
+// Initialisation idempotente des tables D1 (appelée à la demande). Réservé au
+// super_admin : la création de tables en production ne doit pas être exposée à
+// tous les utilisateurs authentifiés.
+app.post("/admin/init", async (c) => {
+    if (c.get("userRole") !== "super_admin") {
+        return c.json({ error: "réservé au super_admin" }, 403);
+    }
+    await initDatabase(c.env.DB);
+    return c.json({ ok: true, tables: SYNCABLE_TABLES });
+});
 
 // État global du serveur : utilisé par le client pour décider s'il doit faire
 // un bootstrap (push initial des données locales) quand le D1 est vide.
