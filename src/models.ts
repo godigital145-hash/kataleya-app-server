@@ -260,6 +260,27 @@ export type TacheProjet = {
     createdBy: string;
 };
 
+export type Entreprise = {
+    id: string;
+    matricule: string;
+    nom: string;
+    adresse: string;
+    telephone: string;
+    email: string;
+    logoDataUrl: string;
+    notesDevis: string;
+    notesFacture: string;
+    conditionsPaiement: string;
+    setupDone: number;
+    customFields: string;
+    devisPrefix: string;
+    facturePrefix: string;
+    numeroFormat: string;
+    tvaDefault: number;
+    devise: string;
+    afficherTVA: number;
+};
+
 // ─── Factory ─────────────────────────────────────────────────────────
 
 export function buildModels(db: D1Database) {
@@ -491,6 +512,26 @@ export function buildModels(db: D1Database) {
             note: "TEXT",
             createdAt: "TEXT NOT NULL",
         }),
+        entreprises: f.createModel<Entreprise>("entreprises", {
+            id: "TEXT PRIMARY KEY NOT NULL",
+            matricule: "TEXT NOT NULL",
+            nom: "TEXT NOT NULL",
+            adresse: "TEXT NOT NULL",
+            telephone: "TEXT NOT NULL",
+            email: "TEXT NOT NULL",
+            logoDataUrl: "TEXT NOT NULL",
+            notesDevis: "TEXT NOT NULL",
+            notesFacture: "TEXT NOT NULL",
+            conditionsPaiement: "TEXT NOT NULL",
+            setupDone: "INTEGER NOT NULL",
+            customFields: "TEXT NOT NULL",
+            devisPrefix: "TEXT NOT NULL",
+            facturePrefix: "TEXT NOT NULL",
+            numeroFormat: "TEXT NOT NULL",
+            tvaDefault: "REAL NOT NULL",
+            devise: "TEXT NOT NULL",
+            afficherTVA: "INTEGER NOT NULL",
+        }),
         taches_projet: f.createModel<TacheProjet>("taches_projet", {
             id: "TEXT PRIMARY KEY NOT NULL",
             projetId: "TEXT NOT NULL",
@@ -527,6 +568,7 @@ export const SYNCABLE_TABLES = [
     "boutiques",
     "stocks_boutique",
     "transferts_stock",
+    "entreprises",
 ] as const;
 
 export type SyncableTable = (typeof SYNCABLE_TABLES)[number];
@@ -552,6 +594,7 @@ export async function initDatabase(db: D1Database): Promise<void> {
     await m.boutiques.createTable();
     await m.stocks_boutique.createTable();
     await m.transferts_stock.createTable();
+    await m.entreprises.createTable();
     await ensureSyncStateTable(m.orm);
     await seedSyncStateIfEmpty(m.orm);
     await runMigrations(m.orm);
