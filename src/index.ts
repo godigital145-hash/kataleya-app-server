@@ -7,6 +7,7 @@ import authRoutes from "./routes/auth";
 import syncRoutes from "./routes/sync";
 import imagesRoutes from "./routes/images";
 import publicRoutes from "./routes/public";
+import updateRoutes from "./routes/update";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -152,6 +153,10 @@ for (const t of SYNCABLE_TABLES) {
 // Routes publiques (site internet) — montées AVANT syncRoutes pour passer
 // avant le handler générique `POST /:table` / `PUT /:table/:id`.
 app.route("/", publicRoutes);
+// Route publique de mise à jour applicative — sert latest.json et les
+// installateurs depuis R2 (prefix "release/"). MONTÉE AVANT authRoutes
+// car aucun token requis.
+app.route("/", updateRoutes);
 
 app.route("/", authRoutes);
 // imagesRoutes AVANT syncRoutes : sync définit un PUT/:table/:id générique qui
