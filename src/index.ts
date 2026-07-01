@@ -8,6 +8,7 @@ import syncRoutes from "./routes/sync";
 import imagesRoutes from "./routes/images";
 import publicRoutes from "./routes/public";
 import updateRoutes from "./routes/update";
+import { SyncRoom } from "./sync-room";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -150,6 +151,18 @@ for (const t of SYNCABLE_TABLES) {
     app.use(`/${t}/*`, requireAuth);
 }
 
+// ─── WebSocket temps réel via Durable Object (remplace le SSE polling) ───
+app.get("/api/sync/ws", async (c) => {
+    const userId = c.get("userId");
+    const url = new URL(c.req.url);
+    url.searchParams.set("x-user-id", userId);
+    const req = new Request(url.toString(), {
+        method: c.req.raw.method,
+        headers: c.req.raw.headers,
+    });
+    return c.env.SYNC_ROOM.getByName("global").fetch(req);
+});
+
 // Routes publiques (site internet) — montées AVANT syncRoutes pour passer
 // avant le handler générique `POST /:table` / `PUT /:table/:id`.
 app.route("/", publicRoutes);
@@ -164,4 +177,5 @@ app.route("/", authRoutes);
 app.route("/", imagesRoutes);
 app.route("/", syncRoutes);
 
+export { SyncRoom };
 export default app;

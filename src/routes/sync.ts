@@ -11,8 +11,8 @@
 //   • Client → POST/PUT/DELETE /:table[/:id] : applique localement puis push
 //     avec `_version`/`_updatedAt`. Le serveur arbitre via `arbitrateLWW` et
 //     répond `{applied: "client" | "server", currentVersion, data?}`.
-//   • SSE /api/sync/events : trigger pur — émet un `journal_update` à chaque
-//     écriture, le client se contente d'appeler son `requestSync()` debouncé.
+//   • WebSocket /api/sync/ws (Durable Object SyncRoom) : notification push
+//     temps réel. Le client reçoit un `journal_update` et appelle `requestSync()`.
 //
 // `sync_journal` n'est plus la source de vérité du pull : démoté en audit log
 // append-only (cf. GET /journal). `sync_state` est l'unique état autoritaire.
@@ -177,6 +177,26 @@ async function logJournal(
         data: data ? JSON.stringify(data) : null,
     });
     return id;
+}
+
+// Notification push temps réel via Durable Object SyncRoom.
+// Tous les clients WebSocket connectés reçoivent l'événement et
+// déclenchent un `requestSync()` debouncé côté client.
+function broadcastToDO(
+    c: Ctx,
+    table: string,
+    id: string,
+    operation: "create" | "update" | "delete",
+): void {
+    try {
+        const stub = c.env.SYNC_ROOM.getByName("global");
+        const clientId = c.req.header("X-Client-ID") || "unknown";
+        c.executionCtx.waitUntil(
+            stub.broadcast(table, id, operation, clientId),
+        );
+    } catch {
+        /* DO non configuré → silencieux */
+    }
 }
 
 // ─── GET /sync-state?since=<version>&limit=<n> ───────────────────────
@@ -362,6 +382,7 @@ app.post("/:table", async (c) => {
     }
     await bumpSyncState(c, table, id, false);
     const journalId = await logJournal(c, "create", table, id, decision.cleanBody);
+    broadcastToDO(c, table, id, "create");
     const { orm } = buildModels(c.env.DB);
     const after = await orm.query<{ version: number }>(
         `SELECT version FROM sync_state WHERE table_name = ? AND element_id = ?`,
@@ -410,6 +431,7 @@ app.put("/:table/:id", async (c) => {
     }
     await bumpSyncState(c, table, id, false);
     const journalId = await logJournal(c, "update", table, id, decision.cleanBody);
+    broadcastToDO(c, table, id, "update");
     const { orm } = buildModels(c.env.DB);
     const after = await orm.query<{ version: number }>(
         `SELECT version FROM sync_state WHERE table_name = ? AND element_id = ?`,
@@ -426,20 +448,50 @@ app.put("/:table/:id", async (c) => {
 // ─── DELETE /:table/:id ──────────────────────────────────────────────
 // Idempotent : si la ligne n'existe pas, on swallow l'erreur et on journalise
 // quand même pour que les autres clients voient la suppression.
+// LWW : si `_version` est fourni (body ou query), on arbitre avant de supprimer.
 app.delete("/:table/:id", async (c) => {
     const table = c.req.param("table");
     const id = c.req.param("id");
     if (!isSyncableTable(table)) return bad(c, "table inconnue", 404);
+
+    // Lecture du _version : body JSON d'abord, puis query param
+    const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+    const _version =
+        typeof body._version === "number"
+            ? body._version
+            : Number(c.req.query("_version")) || undefined;
+
+    if (typeof _version === "number") {
+        const decision = await arbitrateLWW(c, table, id, {
+            _version,
+            id,
+        });
+        if (!decision.apply) return c.json(decision.response);
+    }
+
     const models = buildModels(c.env.DB) as any;
     await models[table].deleteById(id).catch(() => undefined);
     await bumpSyncState(c, table, id, true);
     const journalId = await logJournal(c, "delete", table, id, null);
-    return c.json({ ok: true, journalId });
+    broadcastToDO(c, table, id, "delete");
+    const { orm } = buildModels(c.env.DB);
+    const after = await orm.query<{ version: number }>(
+        `SELECT version FROM sync_state WHERE table_name = ? AND element_id = ?`,
+        [table, id],
+    );
+    return c.json({
+        ok: true,
+        journalId,
+        currentVersion: after[0]?.version ?? 1,
+        applied: "client",
+    });
 });
 
-// ─── SSE /api/sync/events ────────────────────────────────────────────
-// Polling-based stream: vérifie le journal toutes les 3s pendant 25s,
-// l'EventSource côté client se reconnectera automatiquement.
+// ─── SSE /api/sync/events (DEPRECATED) ───────────────────────────────
+// Remplacé par WebSocket /api/sync/ws via Durable Object SyncRoom.
+// Conservé pour compatibilité avec les anciens clients. Sera supprimé
+// après la migration complète vers le DO.
+// Polling-based stream: vérifie le journal toutes les 3s pendant 25s.
 app.get("/api/sync/events", async (c) => {
     const { orm } = buildModels(c.env.DB);
 

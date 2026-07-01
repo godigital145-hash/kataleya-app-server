@@ -12,6 +12,14 @@ database_id = "87e1374c-11d6-4cbf-a81a-422497d01ac3"
 binding = "IMAGES"
 bucket_name = "kataleya-images"
 
+[[durable_objects.bindings]]
+binding = "SYNC_ROOM"
+class_name = "SyncRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SyncRoom"]
+
 [vars]
 JWT_ISSUER = "kataleya"
 
