@@ -13,7 +13,7 @@ binding = "IMAGES"
 bucket_name = "kataleya-images"
 
 [[durable_objects.bindings]]
-binding = "SYNC_ROOM"
+name = "SYNC_ROOM"
 class_name = "SyncRoom"
 
 [[migrations]]
