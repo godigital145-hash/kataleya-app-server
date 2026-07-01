@@ -199,14 +199,18 @@ function broadcastToDO(
     }
 }
 
-// ─── GET /sync-state?since=<version>&limit=<n> ───────────────────────
-// Phase 2.1 — inventaire des lignes modifiées depuis `since`.
-// Pas de filtre par client_id : tous les clients voient les mêmes changements
-// (LWW arbitré côté serveur). Retourne maxVersion pour le prochain `since`.
+// ─── GET /sync-state?sinceVersion=<v>&sinceTable=<t>&sinceId=<id>&limit=<n> ──
+// Phase 2.1 — inventaire des lignes modifiées depuis le curseur.
+// Pagination par tuple (version, table_name, element_id) pour garantir
+// qu'aucune ligne n'est sautée même quand plusieurs partagent la même version.
+// `since` (ancien format, mappe sur sinceVersion) conservé pour compat.
 app.get("/sync-state", async (c) => {
-    const since = Number(c.req.query("since") ?? "0") || 0;
     const limitRaw = Number(c.req.query("limit") ?? "1000") || 1000;
     const limit = Math.min(Math.max(limitRaw, 1), 5000);
+    const sinceVersion = Number(c.req.query("sinceVersion") ?? c.req.query("since") ?? "0") || 0;
+    const sinceTable = c.req.query("sinceTable") || "";
+    const sinceId = c.req.query("sinceId") || "";
+
     const { orm } = buildModels(c.env.DB);
 
     const items = await orm.query<{
@@ -220,19 +224,20 @@ app.get("/sync-state", async (c) => {
         `SELECT table_name, element_id, version, updatedAt, updatedBy, deleted
          FROM sync_state
          WHERE version > ?
-         ORDER BY version ASC
+            OR (version = ? AND table_name > ?)
+            OR (version = ? AND table_name = ? AND element_id > ?)
+         ORDER BY version ASC, table_name ASC, element_id ASC
          LIMIT ?`,
-        [since, limit + 1],
+        [sinceVersion, sinceVersion, sinceTable, sinceVersion, sinceTable, sinceId, limit + 1],
     );
     const hasMore = items.length > limit;
     if (hasMore) items.pop();
 
-    const maxRow = await orm
-        .query<{ v: number | null }>(
-            `SELECT MAX(version) as v FROM sync_state`,
-            [],
-        )
-        .catch(() => [{ v: 0 } as { v: number | null }]);
+    // Curseur suivant = dernier élément retourné (pas le MAX global)
+    const last = items[items.length - 1];
+    const nextVersion = last?.version ?? 0;
+    const nextTable = last?.table_name ?? "";
+    const nextId = last?.element_id ?? "";
 
     return c.json({
         items: items.map((r) => ({
@@ -243,22 +248,34 @@ app.get("/sync-state", async (c) => {
             updatedBy: r.updatedBy,
             deleted: r.deleted === 1,
         })),
-        maxVersion: Number(maxRow[0]?.v ?? 0),
+        maxVersion: nextVersion,
+        maxTable: nextTable,
+        maxId: nextId,
         hasMore,
         serverTime: nowISO(),
     });
 });
 
-// ─── GET /sync-state/full?table=<name>&since=<version> ───────────────
+// ─── GET /sync-state/full?table=<name>&sinceVersion=<v>&sinceId=<id> ──
 // Phase 2.2 — payload joint : sync_state + lignes métier de la table.
 // Pratique pour un client qui veut rattraper son retard sur une table précise
 // sans faire N round-trips. `deleted=1` → row absente de `rows`.
+//
+// Pagination par tuple (version, element_id) : contrairement à `version`
+// seul, ce curseur est unique par ligne et ne manque aucun élément même
+// quand plusieurs lignes partagent la même version (cas du seed initial
+// où tout est à version=1). `since` (ancien format) est conservé pour
+// compatibilité descendante et mappe sur `sinceVersion`.
 app.get("/sync-state/full", async (c) => {
     const table = c.req.query("table") || "";
-    const since = Number(c.req.query("since") ?? "0") || 0;
+    if (!isSyncableTable(table)) return bad(c, "table inconnue", 404);
+
     const limitRaw = Number(c.req.query("limit") ?? "1000") || 1000;
     const limit = Math.min(Math.max(limitRaw, 1), 5000);
-    if (!isSyncableTable(table)) return bad(c, "table inconnue", 404);
+
+    // Curseur tuple (version, element_id) — `since` conservé pour compat
+    const sinceVersion = Number(c.req.query("sinceVersion") ?? c.req.query("since") ?? "0") || 0;
+    const sinceId = c.req.query("sinceId") || "";
 
     const { orm } = buildModels(c.env.DB);
 
@@ -271,10 +288,11 @@ app.get("/sync-state/full", async (c) => {
     }>(
         `SELECT element_id, version, updatedAt, updatedBy, deleted
          FROM sync_state
-         WHERE table_name = ? AND version > ?
-         ORDER BY version ASC
+         WHERE table_name = ?
+           AND (version > ? OR (version = ? AND element_id > ?))
+         ORDER BY version ASC, element_id ASC
          LIMIT ?`,
-        [table, since, limit + 1],
+        [table, sinceVersion, sinceVersion, sinceId, limit + 1],
     );
     const hasMore = states.length > limit;
     if (hasMore) states.pop();
@@ -290,12 +308,10 @@ app.get("/sync-state/full", async (c) => {
         rowsById = new Map(rows.map((r) => [String(r.id), r]));
     }
 
-    const maxRow = await orm
-        .query<{ v: number | null }>(
-            `SELECT MAX(version) as v FROM sync_state WHERE table_name = ?`,
-            [table],
-        )
-        .catch(() => [{ v: 0 } as { v: number | null }]);
+    // Le curseur suivant est le dernier élément retourné (pas le MAX global)
+    const last = states[states.length - 1];
+    const nextVersion = last?.version ?? 0;
+    const nextId = last?.element_id ?? "";
 
     return c.json({
         table,
@@ -307,7 +323,8 @@ app.get("/sync-state/full", async (c) => {
             deleted: s.deleted === 1,
             data: s.deleted === 1 ? null : rowsById.get(s.element_id) ?? null,
         })),
-        maxVersion: Number(maxRow[0]?.v ?? 0),
+        maxVersion: nextVersion,
+        maxId: nextId,
         hasMore,
         serverTime: nowISO(),
     });
